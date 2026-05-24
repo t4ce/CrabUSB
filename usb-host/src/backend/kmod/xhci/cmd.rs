@@ -44,17 +44,17 @@ impl CommandRing {
         &mut self,
         trb: command::Allowed,
     ) -> Result<CommandCompletion, TransferError> {
-        info!("xhci: command request begin");
+        trace!("xhci: command request begin");
         let fur = {
-            info!("xhci: command request locking ring");
+            trace!("xhci: command request locking ring");
             let mut inner = self.0.lock();
-            info!("xhci: command request ring locked");
+            trace!("xhci: command request ring locked");
             let trb_addr = inner.ring.enque_command(trb);
-            info!("xhci: command request enqueued trb={:#x}", trb_addr.raw());
+            trace!("xhci: command request enqueued trb={:#x}", trb_addr.raw());
             let fur = inner.ring.take_finished_future(trb_addr);
-            info!("xhci: command request waiter registered trb={:#x}", trb_addr.raw());
+            trace!("xhci: command request waiter registered trb={:#x}", trb_addr.raw());
             wmb();
-            info!("xhci: command request write doorbell trb={:#x}", trb_addr.raw());
+            trace!("xhci: command request write doorbell trb={:#x}", trb_addr.raw());
             {
                 let mut regs = inner.reg.write();
                 let before = regs.operational.crcr.read_volatile();
@@ -63,7 +63,7 @@ impl CommandRing {
                     .write_volatile_at(0, doorbell::Register::default());
                 let after = regs.operational.crcr.read_volatile();
                 let usbsts_after = regs.operational.usbsts.read_volatile();
-                info!(
+                trace!(
                     "xhci: command doorbell trb={:#x} crr_before={} crr_after={} halted_before={} halted_after={} hse_before={} hse_after={} hce_before={} hce_after={}",
                     trb_addr.raw(),
                     before.command_ring_running(),
@@ -76,12 +76,12 @@ impl CommandRing {
                     usbsts_after.host_controller_error()
                 );
             }
-            info!("xhci: command request waiting completion trb={:#x}", trb_addr.raw());
+            trace!("xhci: command request waiting completion trb={:#x}", trb_addr.raw());
             fur
         };
 
         let res = fur.await;
-        info!("xhci: command request completion received");
+        trace!("xhci: command request completion received");
 
         match res.completion_code() {
             Ok(code) => code.to_result()?,

@@ -77,12 +77,45 @@ struct SubmittedTd {
 
 #[derive(Clone)]
 enum SubmittedTdKind {
-    Normal {
-        completion_trb: TransferId,
-        stream_id: u16,
-    },
+    Normal(NormalTd),
     Control(ControlTd),
     Iso { packets: Vec<IsoPacketTd> },
+}
+
+#[derive(Clone)]
+struct NormalTd {
+    trbs: Vec<NormalTrbTd>,
+    stream_id: u16,
+}
+
+#[derive(Clone, Copy)]
+struct NormalTrbTd {
+    trb: TransferId,
+    offset: usize,
+    len: usize,
+}
+
+impl NormalTd {
+    fn register_waker(&self, ring: &SendRing<TransferEvent>, cx: &mut core::task::Context<'_>) {
+        for trb in &self.trbs {
+            ring.register_cx(trb.trb.0, cx);
+        }
+    }
+
+    fn event_actual_length(&self, event_trb: TransferId, event: TransferEvent) -> usize {
+        let Some(trb) = self.trbs.iter().find(|trb| trb.trb == event_trb) else {
+            return self.requested();
+        };
+        let remaining = (event.trb_transfer_length() as usize).min(trb.len);
+        trb.offset.saturating_add(trb.len.saturating_sub(remaining))
+    }
+
+    fn requested(&self) -> usize {
+        self.trbs
+            .last()
+            .map(|trb| trb.offset.saturating_add(trb.len))
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +149,25 @@ unsafe impl Sync for Endpoint {}
 
 const ENDPOINT_RING_PAGES: usize = 16;
 const STREAM_CONTEXT_TYPE_TRANSFER_RING: u64 = 1;
+const NORMAL_TRB_MAX_TRANSFER_BYTES: usize = 64 * 1024;
+
+fn normal_trb_count_for_len(len: usize) -> usize {
+    len.div_ceil(NORMAL_TRB_MAX_TRANSFER_BYTES).max(1)
+}
+
+fn normal_trb_chunks(len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return vec![(0, 0)];
+    }
+    let mut chunks = Vec::with_capacity(normal_trb_count_for_len(len));
+    let mut offset = 0usize;
+    while offset < len {
+        let chunk_len = core::cmp::min(NORMAL_TRB_MAX_TRANSFER_BYTES, len - offset);
+        chunks.push((offset, chunk_len));
+        offset = offset.saturating_add(chunk_len);
+    }
+    chunks
+}
 
 #[derive(Clone, Copy, Default)]
 #[repr(transparent)]
@@ -312,8 +364,10 @@ impl Endpoint {
         })?;
         self.outstanding_trbs = self.outstanding_trbs.saturating_sub(submitted.trb_count);
         match &submitted.kind {
-            SubmittedTdKind::Normal { completion_trb, .. } => {
-                self.trb_to_request.remove(completion_trb);
+            SubmittedTdKind::Normal(normal_td) => {
+                for trb in &normal_td.trbs {
+                    self.trb_to_request.remove(&trb.trb);
+                }
             }
             SubmittedTdKind::Control(control_td) => {
                 for (trb, _) in (*control_td).trbs() {
@@ -381,10 +435,7 @@ impl Endpoint {
             SubmittedTdKind::Control(control_td) => {
                 control_td.actual.unwrap_or(control_td.requested)
             }
-            SubmittedTdKind::Normal { .. } => {
-                let remaining = event.trb_transfer_length() as usize;
-                transfer.buffer_len().saturating_sub(remaining)
-            }
+            SubmittedTdKind::Normal(normal_td) => normal_td.event_actual_length(event_trb, event),
             SubmittedTdKind::Iso { .. } => unreachable!("ISO was handled above"),
         };
 
@@ -647,7 +698,9 @@ impl Endpoint {
                     2
                 }
             }
-            TransferKind::Bulk | TransferKind::Interrupt => 1,
+            TransferKind::Bulk | TransferKind::Interrupt => {
+                normal_trb_count_for_len(transfer.buffer_len())
+            }
             TransferKind::Isochronous { packet_lengths } => packet_lengths.len().max(1),
         }
     }
@@ -672,7 +725,9 @@ impl Endpoint {
                     2
                 }
             }
-            TransferRequest::Bulk { .. } | TransferRequest::Interrupt { .. } => 1,
+            TransferRequest::Bulk { buffer, .. } | TransferRequest::Interrupt { buffer, .. } => {
+                normal_trb_count_for_len(buffer.map(|buffer| buffer.len).unwrap_or(0))
+            }
             TransferRequest::Isochronous { packets, .. } => packets.len().max(1),
         }
     }
@@ -798,23 +853,40 @@ impl EndpointOp for Endpoint {
                 })
             }
             TransferKind::Interrupt | TransferKind::Bulk => {
-                let trb = transfer::Allowed::Normal(
-                    *Normal::new()
-                        .set_data_buffer_pointer(data_bus_addr as _)
-                        .set_trb_transfer_length(data_len as _)
-                        .set_interrupter_target(0)
-                        .set_interrupt_on_short_packet()
-                        .set_interrupt_on_completion(),
-                );
                 let ring = self
                     .ring_for_stream_mut(stream_id)
                     .ok_or(TransferError::InvalidEndpoint)?;
-                let completion_trb = TransferId(ring.enque_transfer(trb));
-                self.trb_to_request.insert(completion_trb, request_id);
-                SubmittedTdKind::Normal {
-                    completion_trb,
-                    stream_id,
+                let chunks = normal_trb_chunks(data_len);
+                let mut trbs = Vec::with_capacity(chunks.len());
+                for (index, (offset, len)) in chunks.iter().copied().enumerate() {
+                    let last = index + 1 == chunks.len();
+                    let mut normal = Normal::new();
+                    normal
+                        .set_data_buffer_pointer(data_bus_addr.saturating_add(offset as u64))
+                        .set_trb_transfer_length(len as _)
+                        .set_interrupter_target(0);
+                    if matches!(transfer.direction, Direction::In) {
+                        normal.set_interrupt_on_short_packet();
+                    }
+                    if last {
+                        normal.set_interrupt_on_completion();
+                    } else {
+                        normal.set_chain_bit();
+                    }
+                    trbs.push(transfer::Allowed::Normal(normal));
                 }
+
+                let addrs = ring.enqueue_transfer_td(&mut trbs);
+                let mut normal_trbs = Vec::with_capacity(addrs.len());
+                for (addr, (offset, len)) in addrs.into_iter().zip(chunks.into_iter()) {
+                    let trb = TransferId(addr);
+                    self.trb_to_request.insert(trb, request_id);
+                    normal_trbs.push(NormalTrbTd { trb, offset, len });
+                }
+                SubmittedTdKind::Normal(NormalTd {
+                    trbs: normal_trbs,
+                    stream_id,
+                })
             }
             TransferKind::Isochronous { packet_lengths } => {
                 let packets = self.enque_iso(
@@ -852,17 +924,18 @@ impl EndpointOp for Endpoint {
         let request_id = Self::private_request_id(id);
         let kind = self.inflight.get(&request_id)?.kind.clone();
         match kind {
-            SubmittedTdKind::Normal {
-                completion_trb,
-                stream_id,
-            } => {
-                let event = self
-                    .ring_for_stream(stream_id)?
-                    .get_finished(completion_trb.0)?;
-                Some(
-                    self.complete_request(request_id, completion_trb, event)
-                        .map(|transfer| transfer_to_completion(id, transfer)),
-                )
+            SubmittedTdKind::Normal(normal_td) => {
+                let ring = self.ring_for_stream(normal_td.stream_id)?;
+                for trb in &normal_td.trbs {
+                    let Some(event) = ring.get_finished(trb.trb.0) else {
+                        continue;
+                    };
+                    return Some(
+                        self.complete_request(request_id, trb.trb, event)
+                            .map(|transfer| transfer_to_completion(id, transfer)),
+                    );
+                }
+                None
             }
             SubmittedTdKind::Control(control_td) => {
                 self.reclaim_control_request(id, request_id, control_td)
@@ -877,12 +950,9 @@ impl EndpointOp for Endpoint {
             return;
         };
         match &submitted.kind {
-            SubmittedTdKind::Normal {
-                completion_trb,
-                stream_id,
-            } => {
-                if let Some(ring) = self.ring_for_stream(*stream_id) {
-                    ring.register_cx(completion_trb.0, cx);
+            SubmittedTdKind::Normal(normal_td) => {
+                if let Some(ring) = self.ring_for_stream(normal_td.stream_id) {
+                    normal_td.register_waker(ring, cx);
                 }
             }
             SubmittedTdKind::Control(control_td) => {
