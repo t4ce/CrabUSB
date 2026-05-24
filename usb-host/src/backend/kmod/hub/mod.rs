@@ -16,6 +16,7 @@ use id_arena::Id;
 pub trait HubOp: Send + 'static + Any {
     fn init<'a>(&'a mut self, info: HubInfo) -> BoxFuture<'a, Result<HubInfo, USBError>>;
     fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortChangeInfo>, USBError>>;
+    fn request_port_reset<'a>(&'a mut self, port_id: u8) -> BoxFuture<'a, Result<(), USBError>>;
     fn slot_id(&self) -> u8;
 }
 

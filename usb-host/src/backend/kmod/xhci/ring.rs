@@ -100,7 +100,7 @@ impl Ring {
             trb.clear_cycle_bit();
         }
         let addr = self.enque_trb(trb.into());
-        trace!("[CMD] >> {trb:X?} @{addr:X?}");
+        info!("[CMD] >> {trb:X?} @{addr:X?}");
         addr
     }
 

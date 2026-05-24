@@ -188,6 +188,23 @@ impl BackendOp for Core {
         .boxed()
     }
 
+    fn request_root_port_reset<'a>(
+        &'a mut self,
+        port_id: u8,
+    ) -> BoxFuture<'a, Result<(), USBError>> {
+        async move {
+            let root_hub = self
+                .root_hub
+                .ok_or_else(|| USBError::Other(anyhow::anyhow!("root hub is not initialized")))?;
+            let hub = self
+                .hubs
+                .get_mut(root_hub)
+                .ok_or_else(|| USBError::Other(anyhow::anyhow!("root hub id is invalid")))?;
+            hub.backend.request_port_reset(port_id).await
+        }
+        .boxed()
+    }
+
     fn create_event_handler(&mut self) -> Box<dyn EventHandlerOp> {
         self.backend.create_event_handler()
     }

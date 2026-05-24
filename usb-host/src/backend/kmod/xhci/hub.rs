@@ -86,23 +86,10 @@ impl HubOp for XhciRootHub {
         async {
             let mut info = info;
             info.speed = Speed::SuperSpeedPlus;
-            debug!("Resetting all ports of xHCI Root Hub");
+            debug!("Skipping xHCI Root Hub init all-port reset");
 
-            for idx in 0..self.reg.port_register_set.len() {
-                self.reg.port_register_set.update_volatile_at(idx, |reg| {
-                    if !reg.portsc.port_power() {
-                        trace!("Powering on port {}", idx + 1);
-                        reg.portsc.set_port_power();
-                    }
-                });
-            }
-
-            for idx in 0..self.reg.port_register_set.len() {
-                self.reg.port_register_set.update_volatile_at(idx, |reg| {
-                    reg.portsc.set_0_port_enabled_disabled();
-                    reg.portsc.set_port_reset();
-                });
-            }
+            info!("xhci: root hub init port-power loop skipped");
+            self.log_status_mut("root-hub-init-end");
 
             Ok(info)
         }
@@ -111,6 +98,14 @@ impl HubOp for XhciRootHub {
 
     fn slot_id(&self) -> u8 {
         0
+    }
+
+    fn request_port_reset<'a>(&'a mut self, port_id: u8) -> BoxFuture<'a, Result<(), USBError>> {
+        async move {
+            self.request_root_port_reset(port_id)?;
+            Ok(())
+        }
+        .boxed()
     }
 }
 
@@ -129,9 +124,67 @@ impl XhciRootHub {
         }
     }
 
+    fn request_root_port_reset(&mut self, port_id: u8) -> Result<(), USBError> {
+        let Some(idx) = port_id.checked_sub(1).map(usize::from) else {
+            return Err(USBError::Other(anyhow::anyhow!(
+                "invalid root port reset request port=0"
+            )));
+        };
+        if idx >= self.reg.port_register_set.len() {
+            return Err(USBError::Other(anyhow::anyhow!(
+                "root port reset request out of range port={} ports={}",
+                port_id,
+                self.reg.port_register_set.len()
+            )));
+        }
+
+        self.log_port_status("root-hub-port11-reset-begin", port_id);
+        self.log_portsc("root-hub-port11-reset-begin", port_id);
+        self.fail_if_halted("root-hub-port11-reset-begin")?;
+
+        let before = self.reg.port_register_set.read_volatile_at(idx).portsc;
+        if !before.port_power() {
+            self.reg.port_register_set.update_volatile_at(idx, |reg| {
+                reg.portsc.set_port_power();
+            });
+            self.log_port_status("root-hub-port11-after-power", port_id);
+            self.log_portsc("root-hub-port11-after-power", port_id);
+            self.fail_if_halted("root-hub-port11-after-power")?;
+        } else {
+            info!("xhci: root port {} power already set", port_id);
+        }
+
+        let before_ped = self.reg.port_register_set.read_volatile_at(idx).portsc;
+        if before_ped.port_enabled_disabled() {
+            self.reg.port_register_set.update_volatile_at(idx, |reg| {
+                reg.portsc.set_0_port_enabled_disabled();
+            });
+            self.log_port_status("root-hub-port11-after-clear-ped", port_id);
+            self.log_portsc("root-hub-port11-after-clear-ped", port_id);
+            self.fail_if_halted("root-hub-port11-after-clear-ped")?;
+        } else {
+            info!("xhci: root port {} PED already clear; skipping PED write", port_id);
+        }
+
+        self.reg.port_register_set.update_volatile_at(idx, |reg| {
+            reg.portsc.set_port_reset();
+        });
+        self.ports_mut()[idx].state = PortState::Uninit;
+        self.log_port_status("root-hub-port11-after-set-reset", port_id);
+        self.log_portsc("root-hub-port11-after-set-reset", port_id);
+        self.fail_if_halted("root-hub-port11-after-set-reset")?;
+        Ok(())
+    }
+
     async fn _changed_ports(&mut self) -> Result<Vec<PortChangeInfo>, USBError> {
+        self.log_status("root-hub-changed-ports-begin");
+        self.fail_if_halted("root-hub-changed-ports-begin")?;
         self.handle_uninit().await?;
-        self.handle_reseted().await
+        self.log_status("root-hub-after-uninit");
+        self.fail_if_halted("root-hub-after-uninit")?;
+        let out = self.handle_reseted().await;
+        self.log_status("root-hub-after-reseted");
+        out
     }
 
     async fn handle_uninit(&mut self) -> Result<(), USBError> {
@@ -144,6 +197,8 @@ impl XhciRootHub {
 
         for &id in &uninited {
             debug!("Waiting for port {id} reset ...");
+            self.log_port_status("root-hub-before-port-reset-check", id);
+            self.fail_if_halted("root-hub-before-port-reset-check")?;
             let i = (id - 1) as usize;
 
             let port = self.reg.port_register_set.read_volatile_at(i).portsc;
@@ -158,6 +213,8 @@ impl XhciRootHub {
                 port.port_enabled_disabled(),
                 port.current_connect_status()
             );
+            self.log_port_status("root-hub-port-reset-complete", id);
+            self.fail_if_halted("root-hub-port-reset-complete")?;
 
             self.ports_mut()[i].state = PortState::Reseted;
         }
@@ -186,6 +243,8 @@ impl XhciRootHub {
             let speed = Speed::from_xhci_portsc(speed_raw);
             debug!("Port {} device connected at speed {:?}", id, speed);
             debug!("Port {} : \r\n {:?}", id, port_reg.portsc);
+            self.log_port_status("root-hub-before-probed-port", id);
+            self.fail_if_halted("root-hub-before-probed-port")?;
             self.ports_mut()[i].state = PortState::Probed;
 
             out.push(PortChangeInfo {
@@ -198,5 +257,58 @@ impl XhciRootHub {
         }
 
         Ok(out)
+    }
+
+    fn log_status(&self, stage: &'static str) {
+        self.log_status_inner(stage, None);
+    }
+
+    fn log_status_mut(&mut self, stage: &'static str) {
+        self.log_status_inner(stage, None);
+    }
+
+    fn log_port_status(&self, stage: &'static str, port_id: u8) {
+        self.log_status_inner(stage, Some(port_id));
+    }
+
+    fn log_portsc(&self, stage: &'static str, port_id: u8) {
+        let Some(idx) = port_id.checked_sub(1).map(usize::from) else {
+            return;
+        };
+        if idx >= self.reg.port_register_set.len() {
+            return;
+        }
+        let portsc = self.reg.port_register_set.read_volatile_at(idx).portsc;
+        info!("xhci: portsc stage={} port={} {:?}", stage, port_id, portsc);
+    }
+
+    fn log_status_inner(&self, stage: &'static str, port_id: Option<u8>) {
+        let usbsts = self.reg.operational.usbsts.read_volatile();
+        let crcr = self.reg.operational.crcr.read_volatile();
+        info!(
+            "xhci: status stage={} port={} halted={} cnr={} eint={} hse={} hce={} sre={} crr={}",
+            stage,
+            port_id.unwrap_or(0),
+            usbsts.hc_halted(),
+            usbsts.controller_not_ready(),
+            usbsts.event_interrupt(),
+            usbsts.host_system_error(),
+            usbsts.host_controller_error(),
+            usbsts.save_restore_error(),
+            crcr.command_ring_running()
+        );
+    }
+
+    fn fail_if_halted(&self, stage: &'static str) -> Result<(), USBError> {
+        let usbsts = self.reg.operational.usbsts.read_volatile();
+        if usbsts.hc_halted() || usbsts.host_system_error() {
+            return Err(USBError::Other(anyhow::anyhow!(
+                "xHCI halted during root hub scan at {stage}: halted={} hse={} hce={}",
+                usbsts.hc_halted(),
+                usbsts.host_system_error(),
+                usbsts.host_controller_error()
+            )));
+        }
+        Ok(())
     }
 }

@@ -91,6 +91,16 @@ impl HubOp for HubDevice {
     fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortChangeInfo>, USBError>> {
         self.changed_ports().boxed()
     }
+
+    fn request_port_reset<'a>(&'a mut self, port_id: u8) -> BoxFuture<'a, Result<(), USBError>> {
+        async move {
+            Err(USBError::Other(anyhow::anyhow!(
+                "external hub port reset request is not wired yet for port {}",
+                port_id
+            )))
+        }
+        .boxed()
+    }
 }
 
 impl HubDevice {

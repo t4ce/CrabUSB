@@ -45,4 +45,10 @@ pub(crate) trait BackendOp: Send + Any + 'static {
 
     #[cfg(kmod)]
     fn create_event_handler(&mut self) -> Box<dyn crate::backend::ty::EventHandlerOp>;
+
+    #[cfg(kmod)]
+    fn request_root_port_reset<'a>(
+        &'a mut self,
+        port_id: u8,
+    ) -> BoxFuture<'a, Result<(), USBError>>;
 }

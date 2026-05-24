@@ -1,4 +1,4 @@
-#![cfg_attr(target_os = "none", no_std)]
+#![cfg_attr(any(target_os = "none", target_os = "trueos"), no_std)]
 #[macro_use]
 extern crate alloc;
 #[macro_use]

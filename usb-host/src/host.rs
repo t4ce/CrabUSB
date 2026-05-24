@@ -44,6 +44,11 @@ impl USBHost {
         EventHandler { handler }
     }
 
+    #[cfg(kmod)]
+    pub async fn request_root_port_reset(&mut self, port_id: u8) -> Result<()> {
+        self.backend.request_root_port_reset(port_id).await
+    }
+
     pub async fn open_device(&mut self, dev: &DeviceInfo) -> Result<Device> {
         let device = self.backend.open_device(dev.inner.as_ref()).await?;
         let mut device: Device = device.into();

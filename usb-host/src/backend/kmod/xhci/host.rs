@@ -4,7 +4,6 @@ use core::{cell::UnsafeCell, time::Duration};
 use ::xhci::{
     ExtendedCapability,
     extended_capabilities::{List, usb_legacy_support_capability::UsbLegacySupport},
-    registers::doorbell,
     ring::trb::{command, event::CommandCompletion},
 };
 use dma_api::DmaDirection;
@@ -149,8 +148,10 @@ impl Xhci {
         // in the USBSTS is ‘0’ before writing any xHC Operational or Runtime
         // registers.
         self.chip_hardware_reset().await?;
+        self.log_status("after-chip-reset");
 
         self.disable_irq();
+        self.log_status("after-disable-irq");
 
         // Program the Max Device Slots Enabled (MaxSlotsEn) field in the CONFIG
         // register (5.4.7) to enable the device slots that system software is going to
@@ -167,18 +168,24 @@ impl Xhci {
         // Command Ring Control Register (5.4.5) with a 64-bit address pointing to
         // the starting address of the first TRB of the Command Ring.
         self.set_cmd_ring()?;
+        self.log_status("after-set-cmd-ring");
         self.init_irq()?;
+        self.log_status("after-init-irq");
         self.setup_scratchpads()?;
+        self.log_status("after-setup-scratchpads");
         // At this point, the host controller is up and running and the Root Hub ports
         // (5.4.8) will begin reporting device connects, etc., and system software may begin
         // enumerating devices. System software may follow the procedures described in
         // section 4.3, to enumerate attached devices.
         self.start();
         mb();
+        self.log_status("after-start");
 
         self.wait_for_running().await;
+        self.log_status("after-wait-for-running");
 
         self.enable_irq();
+        self.log_status("after-enable-irq");
         // self.reset_ports().await;
 
         Ok(())
@@ -347,9 +354,11 @@ impl Xhci {
 
     pub fn enable_irq(&mut self) {
         debug!("Enable interrupts");
+        self.log_status("before-enable-irq");
         self.reg.write().operational.usbcmd.update_volatile(|r| {
             r.set_interrupter_enable();
         });
+        self.log_status("after-enable-irq-write");
     }
 
     fn setup_dcbaap(&mut self) -> Result {
@@ -475,14 +484,28 @@ impl Xhci {
         .await;
 
         info!("Running");
+        self.log_status("wait-for-running-ready");
 
         // 必须等待至少200ms，否则 port enable = false
         self.kernel.delay(Duration::from_millis(200));
+        self.log_status("wait-for-running-after-settle");
+    }
 
-        self.reg
-            .write()
-            .doorbell
-            .write_volatile_at(0, doorbell::Register::default());
+    fn log_status(&self, stage: &'static str) {
+        let regs = self.reg.read();
+        let usbsts = regs.operational.usbsts.read_volatile();
+        let crcr = regs.operational.crcr.read_volatile();
+        info!(
+            "xhci: status stage={} halted={} cnr={} eint={} hse={} hce={} sre={} crr={}",
+            stage,
+            usbsts.hc_halted(),
+            usbsts.controller_not_ready(),
+            usbsts.event_interrupt(),
+            usbsts.host_system_error(),
+            usbsts.host_controller_error(),
+            usbsts.save_restore_error(),
+            crcr.command_ring_running()
+        );
     }
 
     pub(crate) fn cmd_request(
@@ -630,6 +653,7 @@ impl EventHandler {
                             .set_finished(slot_id, ep_id, ptr.into(), c)
                     };
                 }
+                Allowed::MfindexWrap(c) if c.completion_code().is_ok() => {}
                 _ => {
                     other_events += 1;
                     trace!("xhci: event other {:?}", allowed);
@@ -641,14 +665,16 @@ impl EventHandler {
                 event_loop = 0;
             }
         }
-        trace!(
-            "xhci: event ring drained command={} port={} transfer={} other={} erdp={:#x}",
-            command_events,
-            port_events,
-            transfer_events,
-            other_events,
-            self.event_ring().erst_dequeue_pointer()
-        );
+        if command_events + port_events + transfer_events + other_events > 0 {
+            trace!(
+                "xhci: event ring drained command={} port={} transfer={} other={} erdp={:#x}",
+                command_events,
+                port_events,
+                transfer_events,
+                other_events,
+                self.event_ring().erst_dequeue_pointer()
+            );
+        }
         if matches!(event, Event::Nothing) && transfer_events > 0 {
             event = Event::TransferActivity {
                 count: transfer_events,
@@ -667,31 +693,6 @@ impl EventHandlerOp for EventHandler {
 
         if !has_event_interrupt && !has_pending_event {
             return res;
-        }
-
-        {
-            let irq = self.reg().interrupter_register_set.interrupter_mut(0);
-            let iman = irq.iman.read_volatile();
-            let erdp = irq.erdp.read_volatile();
-            if has_event_interrupt {
-                trace!(
-                    "xhci: handle_event USBSTS.EINT=1 IMAN.IP={} IMAN.IE={} EHB={} ERDP={:#x} sw_erdp={:#x}",
-                    iman.interrupt_pending(),
-                    iman.interrupt_enable(),
-                    erdp.event_handler_busy(),
-                    erdp.event_ring_dequeue_pointer(),
-                    self.event_ring().erst_dequeue_pointer()
-                );
-            } else {
-                trace!(
-                    "xhci: handle_event draining pending event with USBSTS.EINT=0 IMAN.IP={} IMAN.IE={} EHB={} ERDP={:#x} sw_erdp={:#x}",
-                    iman.interrupt_pending(),
-                    iman.interrupt_enable(),
-                    erdp.event_handler_busy(),
-                    erdp.event_ring_dequeue_pointer(),
-                    self.event_ring().erst_dequeue_pointer()
-                );
-            }
         }
 
         if has_event_interrupt {
