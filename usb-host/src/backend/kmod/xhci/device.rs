@@ -410,6 +410,7 @@ impl Device {
 
     async fn setup_interface_endpoints(&mut self, interface: u8, alternate: u8) -> Result {
         self.ctx.perper_change();
+        let uas_alt = self.is_uas_alt(interface, alternate);
         let stale_endpoints = self
             .ep_interfaces
             .iter()
@@ -459,7 +460,25 @@ impl Device {
                 periodic_burst_size,
                 desc.interval,
             );
-            let ring_addr = ep_raw.bus_addr();
+            let use_streams = uas_alt
+                && matches!(desc.transfer_type, EndpointType::Bulk)
+                && desc.address != 0x04;
+            let ring_addr = if use_streams {
+                let stream_ctx_addr = ep_raw.configure_primary_streams(32)?;
+                for ring in ep_raw.stream_rings() {
+                    self.transfer_result_handler
+                        .register_queue(self.id.as_u8(), dci, ring);
+                }
+                info!(
+                    "xhci: uas streams ep addr={:#x} dci={} streams=32 ctx={:#x}",
+                    desc.address,
+                    dci,
+                    stream_ctx_addr.raw()
+                );
+                stream_ctx_addr
+            } else {
+                ep_raw.bus_addr()
+            };
             self.eps
                 .insert(desc.address, Endpoint::new((&desc).into(), ep_raw));
             self.ep_interfaces.insert(desc.address, interface);
@@ -489,7 +508,12 @@ impl Device {
                 ep_mut.set_tr_dequeue_pointer(ring_addr.raw());
                 ep_mut.set_max_packet_size(desc.max_packet_size);
                 ep_mut.set_error_count(3);
-                ep_mut.set_dequeue_cycle_state();
+                if use_streams {
+                    ep_mut.set_max_primary_streams(4);
+                    ep_mut.set_linear_stream_array();
+                } else {
+                    ep_mut.set_dequeue_cycle_state();
+                }
 
                 match desc.transfer_type {
                     EndpointType::Isochronous | EndpointType::Interrupt => {
@@ -563,6 +587,21 @@ impl Device {
             }
         }
         Err(USBError::NotFound)
+    }
+
+    fn is_uas_alt(&self, interface: u8, alternate: u8) -> bool {
+        let Ok(config) = self.current_config_desc() else {
+            return false;
+        };
+        config.interfaces.iter().any(|iface| {
+            iface.interface_number == interface
+                && iface.alt_settings.iter().any(|alt| {
+                    alt.alternate_setting == alternate
+                        && alt.class == 0x08
+                        && alt.subclass == 0x06
+                        && alt.protocol == 0x62
+                })
+        })
     }
 
     fn current_config_desc(&self) -> Result<&ConfigurationDescriptor> {

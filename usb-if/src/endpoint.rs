@@ -149,6 +149,7 @@ pub enum TransferRequest {
     Bulk {
         direction: Direction,
         buffer: Option<TransferBuffer>,
+        stream_id: Option<u16>,
     },
     Interrupt {
         direction: Direction,
@@ -182,6 +183,7 @@ impl TransferRequest {
         Self::Bulk {
             direction: Direction::In,
             buffer: TransferBuffer::from_mut_slice(buffer),
+            stream_id: None,
         }
     }
 
@@ -189,6 +191,23 @@ impl TransferRequest {
         Self::Bulk {
             direction: Direction::Out,
             buffer: TransferBuffer::from_slice(buffer),
+            stream_id: None,
+        }
+    }
+
+    pub fn bulk_in_on_stream(buffer: &mut [u8], stream_id: u16) -> Self {
+        Self::Bulk {
+            direction: Direction::In,
+            buffer: TransferBuffer::from_mut_slice(buffer),
+            stream_id: Some(stream_id),
+        }
+    }
+
+    pub fn bulk_out_on_stream(buffer: &[u8], stream_id: u16) -> Self {
+        Self::Bulk {
+            direction: Direction::Out,
+            buffer: TransferBuffer::from_slice(buffer),
+            stream_id: Some(stream_id),
         }
     }
 
@@ -254,6 +273,13 @@ impl TransferRequest {
             _ => &[],
         }
     }
+
+    pub fn stream_id(&self) -> Option<u16> {
+        match self {
+            Self::Bulk { stream_id, .. } => *stream_id,
+            _ => None,
+        }
+    }
 }
 
 impl From<TransferRequest> for (TransferKind, Direction, Option<TransferBuffer>) {
@@ -264,7 +290,9 @@ impl From<TransferRequest> for (TransferKind, Direction, Option<TransferBuffer>)
                 direction,
                 buffer,
             } => (TransferKind::Control(setup), direction, buffer),
-            TransferRequest::Bulk { direction, buffer } => (TransferKind::Bulk, direction, buffer),
+            TransferRequest::Bulk {
+                direction, buffer, ..
+            } => (TransferKind::Bulk, direction, buffer),
             TransferRequest::Interrupt { direction, buffer } => {
                 (TransferKind::Interrupt, direction, buffer)
             }
@@ -291,7 +319,11 @@ impl From<(TransferKind, Direction, Option<TransferBuffer>)> for TransferRequest
                 direction,
                 buffer,
             },
-            TransferKind::Bulk => Self::Bulk { direction, buffer },
+            TransferKind::Bulk => Self::Bulk {
+                direction,
+                buffer,
+                stream_id: None,
+            },
             TransferKind::Interrupt => Self::Interrupt { direction, buffer },
             TransferKind::Isochronous { packet_lengths } => Self::Isochronous {
                 direction,

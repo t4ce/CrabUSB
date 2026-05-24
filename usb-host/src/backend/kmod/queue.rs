@@ -91,14 +91,12 @@ impl<C> Finished<C> {
         self.inner.clear_finished(addr);
     }
 
-    pub fn set_finished(&self, addr: BusAddr, value: C) {
+    pub fn set_finished(&self, addr: BusAddr, value: C) -> core::result::Result<(), C> {
         if let Some(slot) = self.inner.data.get(&addr) {
             slot.set_finished(value);
-        } else if take_queue_log_budget() {
-            warn!(
-                "usb queue: completion address {:#x} is not registered",
-                addr.raw()
-            );
+            Ok(())
+        } else {
+            Err(value)
         }
     }
 

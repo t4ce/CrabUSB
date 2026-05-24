@@ -1,12 +1,12 @@
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 
-use dma_api::DmaDirection;
+use dma_api::{DArray, DmaDirection};
 use mbarrier::mb;
 use spin::Mutex;
 use usb_if::{
     descriptor::{self, EndpointDescriptor},
     endpoint::{RequestId, TransferCompletion, TransferRequest},
-    err::TransferError,
+    err::{TransferError, USBError},
     transfer::{BmRequestType, Direction},
 };
 use xhci::{
@@ -77,7 +77,10 @@ struct SubmittedTd {
 
 #[derive(Clone)]
 enum SubmittedTdKind {
-    Normal { completion_trb: TransferId },
+    Normal {
+        completion_trb: TransferId,
+        stream_id: u16,
+    },
     Control(ControlTd),
     Iso { packets: Vec<IsoPacketTd> },
 }
@@ -93,6 +96,8 @@ struct IsoPacketTd {
 pub struct Endpoint {
     dci: Dci,
     pub ring: SendRing<TransferEvent>,
+    stream_contexts: Option<DArray<StreamContext>>,
+    stream_rings: Vec<Option<SendRing<TransferEvent>>>,
     bell: Arc<Mutex<SlotBell>>,
     next_request_id: u64,
     inflight: BTreeMap<EndpointRequestId, SubmittedTd>,
@@ -110,6 +115,22 @@ unsafe impl Send for Endpoint {}
 unsafe impl Sync for Endpoint {}
 
 const ENDPOINT_RING_PAGES: usize = 16;
+const STREAM_CONTEXT_TYPE_TRANSFER_RING: u64 = 1;
+
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+struct StreamContext([u32; 4]);
+
+impl StreamContext {
+    fn transfer_ring(ring_addr: BusAddr, cycle: bool) -> Self {
+        let mut ptr = ring_addr.raw() & !0xf;
+        ptr |= STREAM_CONTEXT_TYPE_TRANSFER_RING << 1;
+        if cycle {
+            ptr |= 1;
+        }
+        Self([ptr as u32, (ptr >> 32) as u32, 0, 0])
+    }
+}
 
 impl Endpoint {
     pub fn new(dci: Dci, kernel: &Kernel, bell: Arc<Mutex<SlotBell>>) -> crate::err::Result<Self> {
@@ -119,6 +140,8 @@ impl Endpoint {
         Ok(Self {
             dci,
             ring,
+            stream_contexts: None,
+            stream_rings: Vec::new(),
             bell,
             next_request_id: 1,
             inflight: BTreeMap::new(),
@@ -149,9 +172,66 @@ impl Endpoint {
         self.ring.bus_addr()
     }
 
-    fn doorbell(&mut self) {
+    pub fn configure_primary_streams(&mut self, count: usize) -> crate::err::Result<BusAddr> {
+        let count = count.clamp(2, 32);
+        let allocated_contexts = (self.kernel.page_size() / core::mem::size_of::<StreamContext>())
+            .max(count);
+        let mut contexts = self.kernel.array_zero_with_align::<StreamContext>(
+            allocated_contexts,
+            self.kernel.page_size(),
+            DmaDirection::Bidirectional,
+        )
+        .map_err(|_| USBError::NoMemory)?;
+        let mut stream_rings = Vec::with_capacity(count);
+        stream_rings.push(None);
+        for stream_id in 1..count {
+            let ring = SendRing::new_with_pages(
+                ENDPOINT_RING_PAGES,
+                DmaDirection::Bidirectional,
+                &self.kernel,
+            )?;
+            contexts.set(
+                stream_id,
+                StreamContext::transfer_ring(ring.bus_addr(), ring.cycle()),
+            );
+            stream_rings.push(Some(ring));
+        }
+        let addr = contexts.dma_addr().as_u64().into();
+        self.stream_contexts = Some(contexts);
+        self.stream_rings = stream_rings;
+        Ok(addr)
+    }
+
+    pub fn stream_rings(&self) -> impl Iterator<Item = &SendRing<TransferEvent>> {
+        self.stream_rings.iter().filter_map(|ring| ring.as_ref())
+    }
+
+    fn ring_for_stream(&self, stream_id: u16) -> Option<&SendRing<TransferEvent>> {
+        if stream_id == 0 {
+            Some(&self.ring)
+        } else {
+            self.stream_rings
+                .get(stream_id as usize)
+                .and_then(|ring| ring.as_ref())
+        }
+    }
+
+    fn ring_for_stream_mut(&mut self, stream_id: u16) -> Option<&mut SendRing<TransferEvent>> {
+        if stream_id == 0 {
+            Some(&mut self.ring)
+        } else {
+            self.stream_rings
+                .get_mut(stream_id as usize)
+                .and_then(|ring| ring.as_mut())
+        }
+    }
+
+    fn doorbell(&mut self, stream_id: u16) {
         let mut bell = doorbell::Register::default();
         bell.set_doorbell_target(self.dci.into());
+        if stream_id != 0 {
+            bell.set_doorbell_stream_id(stream_id);
+        }
         self.bell.lock().ring(bell);
     }
 
@@ -232,7 +312,7 @@ impl Endpoint {
         })?;
         self.outstanding_trbs = self.outstanding_trbs.saturating_sub(submitted.trb_count);
         match &submitted.kind {
-            SubmittedTdKind::Normal { completion_trb } => {
+            SubmittedTdKind::Normal { completion_trb, .. } => {
                 self.trb_to_request.remove(completion_trb);
             }
             SubmittedTdKind::Control(control_td) => {
@@ -572,8 +652,11 @@ impl Endpoint {
         }
     }
 
-    fn ensure_ring_capacity(&self, required: usize) -> Result<(), TransferError> {
-        let usable = self.ring.usable_capacity().saturating_sub(1);
+    fn ensure_ring_capacity(&self, required: usize, stream_id: u16) -> Result<(), TransferError> {
+        let ring = self
+            .ring_for_stream(stream_id)
+            .ok_or(TransferError::InvalidEndpoint)?;
+        let usable = ring.usable_capacity().saturating_sub(1);
         if self.outstanding_trbs.saturating_add(required) > usable {
             return Err(TransferError::QueueFull);
         }
@@ -598,7 +681,8 @@ impl Endpoint {
 impl EndpointOp for Endpoint {
     fn submit_request(&mut self, request: TransferRequest) -> Result<RequestId, TransferError> {
         let required_trbs = Self::required_trbs_for_request(&request);
-        self.ensure_ring_capacity(required_trbs)?;
+        let stream_id = request.stream_id().unwrap_or(0);
+        self.ensure_ring_capacity(required_trbs, stream_id)?;
         let transfer = Transfer::from_request(&self.kernel, request)?;
         debug_assert_eq!(required_trbs, Self::required_trbs(&transfer));
 
@@ -722,9 +806,15 @@ impl EndpointOp for Endpoint {
                         .set_interrupt_on_short_packet()
                         .set_interrupt_on_completion(),
                 );
-                let completion_trb = TransferId(self.ring.enque_transfer(trb));
+                let ring = self
+                    .ring_for_stream_mut(stream_id)
+                    .ok_or(TransferError::InvalidEndpoint)?;
+                let completion_trb = TransferId(ring.enque_transfer(trb));
                 self.trb_to_request.insert(completion_trb, request_id);
-                SubmittedTdKind::Normal { completion_trb }
+                SubmittedTdKind::Normal {
+                    completion_trb,
+                    stream_id,
+                }
             }
             TransferKind::Isochronous { packet_lengths } => {
                 let packets = self.enque_iso(
@@ -750,7 +840,7 @@ impl EndpointOp for Endpoint {
             },
         );
         mb();
-        self.doorbell();
+        self.doorbell(stream_id);
 
         Ok(Self::public_request_id(request_id))
     }
@@ -762,8 +852,13 @@ impl EndpointOp for Endpoint {
         let request_id = Self::private_request_id(id);
         let kind = self.inflight.get(&request_id)?.kind.clone();
         match kind {
-            SubmittedTdKind::Normal { completion_trb } => {
-                let event = self.ring.get_finished(completion_trb.0)?;
+            SubmittedTdKind::Normal {
+                completion_trb,
+                stream_id,
+            } => {
+                let event = self
+                    .ring_for_stream(stream_id)?
+                    .get_finished(completion_trb.0)?;
                 Some(
                     self.complete_request(request_id, completion_trb, event)
                         .map(|transfer| transfer_to_completion(id, transfer)),
@@ -782,8 +877,13 @@ impl EndpointOp for Endpoint {
             return;
         };
         match &submitted.kind {
-            SubmittedTdKind::Normal { completion_trb } => {
-                self.ring.register_cx(completion_trb.0, cx);
+            SubmittedTdKind::Normal {
+                completion_trb,
+                stream_id,
+            } => {
+                if let Some(ring) = self.ring_for_stream(*stream_id) {
+                    ring.register_cx(completion_trb.0, cx);
+                }
             }
             SubmittedTdKind::Control(control_td) => {
                 control_td.register_waker(&self.ring, cx);

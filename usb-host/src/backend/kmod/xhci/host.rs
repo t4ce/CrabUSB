@@ -618,7 +618,7 @@ impl EventHandler {
                         c.slot_id(),
                         c.completion_code()
                     );
-                    self.cmd_finished.set_finished(addr.into(), c);
+                    let _ = self.cmd_finished.set_finished(addr.into(), c);
                 }
                 Allowed::PortStatusChange(st) => {
                     port_events += 1;
