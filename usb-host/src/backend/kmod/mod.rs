@@ -26,9 +26,25 @@ pub use dwc::{
 };
 pub use osal::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum XhciRootHubInitPolicy {
+    SelectivePorts3And4Skip11,
+    FullAllPorts,
+}
+
 impl USBHost {
     pub fn new_xhci(mmio: Mmio, kernel: &'static dyn KernelOp) -> Result<USBHost> {
         Ok(USBHost::new(Xhci::new(mmio, kernel)?))
+    }
+
+    pub fn new_xhci_with_root_hub_init_policy(
+        mmio: Mmio,
+        kernel: &'static dyn KernelOp,
+        policy: XhciRootHubInitPolicy,
+    ) -> Result<USBHost> {
+        Ok(USBHost::new(Xhci::new_with_root_hub_init_policy(
+            mmio, kernel, policy,
+        )?))
     }
 
     pub fn new_dwc(params: DwcNewParams<'_, impl CruOp>) -> Result<USBHost> {

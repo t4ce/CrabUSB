@@ -22,7 +22,7 @@ use super::{
     transfer::TransferResultHandler,
 };
 use crate::{
-    DeviceAddressInfo, KernelOp, Mmio,
+    DeviceAddressInfo, KernelOp, Mmio, XhciRootHubInitPolicy,
     backend::{
         kmod::{hub::HubOp, kcore::CoreOp, xhci::reg::SlotBell},
         ty::{DeviceOp, Event, EventHandlerOp},
@@ -82,6 +82,18 @@ impl CoreOp for Xhci {
 
 impl Xhci {
     pub fn new(mmio: Mmio, kernel: &'static dyn KernelOp) -> Result<Self> {
+        Self::new_with_root_hub_init_policy(
+            mmio,
+            kernel,
+            XhciRootHubInitPolicy::SelectivePorts3And4Skip11,
+        )
+    }
+
+    pub fn new_with_root_hub_init_policy(
+        mmio: Mmio,
+        kernel: &'static dyn KernelOp,
+        root_hub_init_policy: XhciRootHubInitPolicy,
+    ) -> Result<Self> {
         let reg = XhciRegisters::new(mmio);
 
         // 检查 xHCI 控制器的寻址能力（HCCPARAMS1 寄存器）
@@ -116,7 +128,7 @@ impl Xhci {
         let event_ring = EventRing::new(max_event_ring_segments, &kernel)?;
         let event_ring_info = event_ring.info();
 
-        let root_hub = XhciRootHub::new(reg.clone())?;
+        let root_hub = XhciRootHub::new(reg.clone(), root_hub_init_policy)?;
 
         let transfer_result_handler = TransferResultHandler::new(reg_shared.clone());
         let ports = root_hub.waker();

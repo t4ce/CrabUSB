@@ -11,7 +11,10 @@ use core::{
 use futures::{FutureExt, future::BoxFuture, task::AtomicWaker};
 use usb_if::{err::USBError, host::hub::Speed};
 
-use crate::backend::kmod::hub::{HubInfo, HubOp, PortChangeInfo, PortState};
+use crate::backend::kmod::{
+    XhciRootHubInitPolicy,
+    hub::{HubInfo, HubOp, PortChangeInfo, PortState},
+};
 
 use super::reg::XhciRegisters;
 
@@ -63,6 +66,7 @@ pub struct XhciRootHub {
     reg: XhciRegisters,
 
     ports: Arc<UnsafeCell<Vec<Port>>>,
+    init_policy: XhciRootHubInitPolicy,
 }
 
 unsafe impl Send for XhciRootHub {}
@@ -86,9 +90,15 @@ impl HubOp for XhciRootHub {
         async {
             let mut info = info;
             info.speed = Speed::SuperSpeedPlus;
-            debug!("Skipping xHCI Root Hub init all-port reset");
+            match self.init_policy {
+                XhciRootHubInitPolicy::SelectivePorts3And4Skip11 => {
+                    self.init_selective_ports_3_4_skip_11()?;
+                }
+                XhciRootHubInitPolicy::FullAllPorts => {
+                    self.init_all_ports()?;
+                }
+            }
 
-            info!("xhci: root hub init port-power loop skipped");
             self.log_status_mut("root-hub-init-end");
 
             Ok(info)
@@ -111,11 +121,18 @@ impl HubOp for XhciRootHub {
 
 impl XhciRootHub {
     /// 创建新的 xHCI Root Hub
-    pub fn new(reg: XhciRegisters) -> Result<Self, USBError> {
+    pub fn new(
+        reg: XhciRegisters,
+        init_policy: XhciRootHubInitPolicy,
+    ) -> Result<Self, USBError> {
         let port_num = reg.port_register_set.len();
         let ports = PortChangeWaker::new(port_num as _).ports.clone();
 
-        Ok(Self { reg, ports })
+        Ok(Self {
+            reg,
+            ports,
+            init_policy,
+        })
     }
 
     pub fn waker(&self) -> PortChangeWaker {
@@ -138,18 +155,18 @@ impl XhciRootHub {
             )));
         }
 
-        self.log_port_status("root-hub-port11-reset-begin", port_id);
-        self.log_portsc("root-hub-port11-reset-begin", port_id);
-        self.fail_if_halted("root-hub-port11-reset-begin")?;
+        self.log_port_status("root-hub-port-reset-request-begin", port_id);
+        self.log_portsc("root-hub-port-reset-request-begin", port_id);
+        self.fail_if_halted("root-hub-port-reset-request-begin")?;
 
         let before = self.reg.port_register_set.read_volatile_at(idx).portsc;
         if !before.port_power() {
             self.reg.port_register_set.update_volatile_at(idx, |reg| {
                 reg.portsc.set_port_power();
             });
-            self.log_port_status("root-hub-port11-after-power", port_id);
-            self.log_portsc("root-hub-port11-after-power", port_id);
-            self.fail_if_halted("root-hub-port11-after-power")?;
+            self.log_port_status("root-hub-port-reset-request-after-power", port_id);
+            self.log_portsc("root-hub-port-reset-request-after-power", port_id);
+            self.fail_if_halted("root-hub-port-reset-request-after-power")?;
         } else {
             info!("xhci: root port {} power already set", port_id);
         }
@@ -159,9 +176,9 @@ impl XhciRootHub {
             self.reg.port_register_set.update_volatile_at(idx, |reg| {
                 reg.portsc.set_0_port_enabled_disabled();
             });
-            self.log_port_status("root-hub-port11-after-clear-ped", port_id);
-            self.log_portsc("root-hub-port11-after-clear-ped", port_id);
-            self.fail_if_halted("root-hub-port11-after-clear-ped")?;
+            self.log_port_status("root-hub-port-reset-request-after-clear-ped", port_id);
+            self.log_portsc("root-hub-port-reset-request-after-clear-ped", port_id);
+            self.fail_if_halted("root-hub-port-reset-request-after-clear-ped")?;
         } else {
             info!("xhci: root port {} PED already clear; skipping PED write", port_id);
         }
@@ -170,9 +187,51 @@ impl XhciRootHub {
             reg.portsc.set_port_reset();
         });
         self.ports_mut()[idx].state = PortState::Uninit;
-        self.log_port_status("root-hub-port11-after-set-reset", port_id);
-        self.log_portsc("root-hub-port11-after-set-reset", port_id);
-        self.fail_if_halted("root-hub-port11-after-set-reset")?;
+        self.log_port_status("root-hub-port-reset-request-after-set-reset", port_id);
+        self.log_portsc("root-hub-port-reset-request-after-set-reset", port_id);
+        self.fail_if_halted("root-hub-port-reset-request-after-set-reset")?;
+        Ok(())
+    }
+
+    fn init_selective_ports_3_4_skip_11(&mut self) -> Result<(), USBError> {
+        debug!("Observing selected xHCI Root Hub ports");
+        self.log_status_mut("root-hub-init-begin");
+        self.fail_if_halted("root-hub-init-begin")?;
+
+        info!("xhci: root hub baremetal init observes ports=3,4 skip=11 reset_deferred=true");
+        self.log_portsc("root-hub-selective-before", 3);
+        self.log_portsc("root-hub-selective-before", 4);
+        self.log_portsc("root-hub-selective-skip", 11);
+        info!("xhci: root port 11 selective reset skipped reason=known-problematic-leds");
+
+        Ok(())
+    }
+
+    fn init_all_ports(&mut self) -> Result<(), USBError> {
+        debug!("Resetting all ports of xHCI Root Hub");
+        self.log_status_mut("root-hub-init-begin");
+        self.fail_if_halted("root-hub-init-begin")?;
+
+        info!("xhci: root hub qemu/full reset all ports");
+        for idx in 0..self.reg.port_register_set.len() {
+            self.reg.port_register_set.update_volatile_at(idx, |reg| {
+                if !reg.portsc.port_power() {
+                    trace!("Powering on port {}", idx + 1);
+                    reg.portsc.set_port_power();
+                }
+            });
+        }
+        self.log_status_mut("root-hub-after-port-power");
+        self.fail_if_halted("root-hub-after-port-power")?;
+
+        for idx in 0..self.reg.port_register_set.len() {
+            self.reg.port_register_set.update_volatile_at(idx, |reg| {
+                reg.portsc.set_0_port_enabled_disabled();
+                reg.portsc.set_port_reset();
+            });
+        }
+        self.log_status_mut("root-hub-after-all-port-reset");
+        self.fail_if_halted("root-hub-after-all-port-reset")?;
         Ok(())
     }
 
