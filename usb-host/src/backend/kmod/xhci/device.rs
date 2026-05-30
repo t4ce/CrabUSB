@@ -38,6 +38,8 @@ use crate::{
     err::Result,
 };
 
+const XHCI_UAS_PRIMARY_STREAMS_ENABLED: bool = true;
+
 pub struct Device {
     id: SlotId,
     ctx: ContextData,
@@ -460,7 +462,8 @@ impl Device {
                 periodic_burst_size,
                 desc.interval,
             );
-            let use_streams = uas_alt
+            let use_streams = XHCI_UAS_PRIMARY_STREAMS_ENABLED
+                && uas_alt
                 && matches!(desc.transfer_type, EndpointType::Bulk)
                 && desc.address != 0x04;
             let ring_addr = if use_streams {
