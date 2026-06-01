@@ -1,7 +1,9 @@
 use alloc::vec::Vec;
 
 use dma_api::{DArray, DBox, DmaDirection};
-use xhci::context::{Device32Byte, Device64Byte, Input32Byte, Input64Byte, InputHandler};
+use xhci::context::{
+    Device32Byte, Device64Byte, DeviceHandler, Input32Byte, Input64Byte, InputHandler,
+};
 
 use super::SlotId;
 use crate::{err::*, osal::Kernel};
@@ -79,6 +81,22 @@ impl ContextData {
                 let mut input = ctx.input.read();
                 f(&mut input);
                 ctx.input.write(input);
+            }
+        }
+    }
+
+    pub fn with_output<F>(&self, f: F)
+    where
+        F: FnOnce(&dyn DeviceHandler),
+    {
+        match self {
+            ContextData::Context32(ctx) => {
+                let out = ctx.out.read();
+                f(&out);
+            }
+            ContextData::Context64(ctx) => {
+                let out = ctx.out.read();
+                f(&out);
             }
         }
     }

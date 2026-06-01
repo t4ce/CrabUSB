@@ -38,8 +38,6 @@ use crate::{
     err::Result,
 };
 
-const XHCI_UAS_PRIMARY_STREAMS_ENABLED: bool = true;
-
 pub struct Device {
     id: SlotId,
     ctx: ContextData,
@@ -446,8 +444,7 @@ impl Device {
         {
             let dci = desc.dci();
             let mut ep_raw = self.new_ep(dci.into())?;
-            let use_streams = XHCI_UAS_PRIMARY_STREAMS_ENABLED
-                && uas_alt
+            let use_streams = uas_alt
                 && matches!(desc.transfer_type, EndpointType::Bulk)
                 && desc.address != 0x04;
             let endpoint_burst_size = match self.port_speed {
@@ -459,7 +456,6 @@ impl Device {
                 {
                     desc.packets_per_microframe.saturating_sub(1)
                 }
-                Speed::SuperSpeed | Speed::SuperSpeedPlus if use_streams => 15,
                 _ => 0,
             };
             ep_raw.configure_periodic(
@@ -515,7 +511,6 @@ impl Device {
                 if use_streams {
                     ep_mut.set_max_primary_streams(4);
                     ep_mut.set_linear_stream_array();
-                    ep_mut.set_max_burst_size(endpoint_burst_size.try_into().unwrap());
                 } else {
                     ep_mut.set_dequeue_cycle_state();
                 }
@@ -569,10 +564,37 @@ impl Device {
                     .set_input_context_pointer(self.ctx.input_bus_addr()),
             ))
             .await?;
+        if uas_alt {
+            self.log_configured_endpoint_contexts(interface, alternate);
+        }
         // Keep old endpoint rings alive until hardware accepts the new input context.
         drop(old_endpoints);
 
         Ok(())
+    }
+
+    fn log_configured_endpoint_contexts(&self, interface: u8, alternate: u8) {
+        let Ok(endpoints) = self.find_interface_endpoints(interface, alternate) else {
+            return;
+        };
+        self.ctx.with_output(|out| {
+            for desc in endpoints {
+                let dci = desc.dci() as usize;
+                let ep = out.endpoint(dci);
+                info!(
+                    "xhci: endpoint context after-config ep={:#x} dci={} state={:?} type={:?} mps={} burst={} maxpstreams={} lsa={} trdp={:#x}",
+                    desc.address,
+                    dci,
+                    ep.endpoint_state(),
+                    ep.endpoint_type(),
+                    ep.max_packet_size(),
+                    ep.max_burst_size(),
+                    ep.max_primary_streams(),
+                    ep.linear_stream_array(),
+                    ep.tr_dequeue_pointer()
+                );
+            }
+        });
     }
 
     fn find_interface_endpoints(

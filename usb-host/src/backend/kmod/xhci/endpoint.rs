@@ -853,6 +853,7 @@ impl EndpointOp for Endpoint {
                 })
             }
             TransferKind::Interrupt | TransferKind::Bulk => {
+                let max_packet_size = self.max_packet_size;
                 let ring = self
                     .ring_for_stream_mut(stream_id)
                     .ok_or(TransferError::InvalidEndpoint)?;
@@ -860,10 +861,19 @@ impl EndpointOp for Endpoint {
                 let mut trbs = Vec::with_capacity(chunks.len());
                 for (index, (offset, len)) in chunks.iter().copied().enumerate() {
                     let last = index + 1 == chunks.len();
+                    let remaining_after = data_len.saturating_sub(offset.saturating_add(len));
+                    let td_size = if max_packet_size == 0 {
+                        0
+                    } else {
+                        remaining_after
+                            .div_ceil(max_packet_size)
+                            .min(0x1f) as u8
+                    };
                     let mut normal = Normal::new();
                     normal
                         .set_data_buffer_pointer(data_bus_addr.saturating_add(offset as u64))
                         .set_trb_transfer_length(len as _)
+                        .set_td_size(td_size)
                         .set_interrupter_target(0);
                     if matches!(transfer.direction, Direction::In) {
                         normal.set_interrupt_on_short_packet();
