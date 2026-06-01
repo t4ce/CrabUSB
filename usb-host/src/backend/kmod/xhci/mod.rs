@@ -8,6 +8,7 @@ pub(crate) mod host;
 pub(crate) mod hub;
 mod reg;
 mod ring;
+mod root_hub_profile;
 mod sync;
 mod transfer;
 

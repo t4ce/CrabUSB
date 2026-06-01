@@ -16,7 +16,7 @@ use crate::backend::kmod::{
     hub::{HubInfo, HubOp, PortChangeInfo, PortState},
 };
 
-use super::reg::XhciRegisters;
+use super::{reg::XhciRegisters, root_hub_profile::XhciRootHubPhysics};
 
 pub struct PortChangeWaker {
     ports: Arc<UnsafeCell<Vec<Port>>>,
@@ -66,7 +66,7 @@ pub struct XhciRootHub {
     reg: XhciRegisters,
 
     ports: Arc<UnsafeCell<Vec<Port>>>,
-    init_policy: XhciRootHubInitPolicy,
+    physics: XhciRootHubPhysics,
 }
 
 unsafe impl Send for XhciRootHub {}
@@ -90,12 +90,12 @@ impl HubOp for XhciRootHub {
         async {
             let mut info = info;
             info.speed = Speed::SuperSpeedPlus;
-            match self.init_policy {
-                XhciRootHubInitPolicy::SelectivePorts3And4Skip11 => {
-                    self.init_selective_ports_3_4_skip_11()?;
+            match self.physics {
+                XhciRootHubPhysics::BaremetalSelective => {
+                    self.init_baremetal_selective_ports()?;
                 }
-                XhciRootHubInitPolicy::FullAllPorts => {
-                    self.init_all_ports()?;
+                XhciRootHubPhysics::EmulatedFullReset => {
+                    self.init_emulated_full_reset_ports()?;
                 }
             }
 
@@ -131,7 +131,7 @@ impl XhciRootHub {
         Ok(Self {
             reg,
             ports,
-            init_policy,
+            physics: XhciRootHubPhysics::from_init_policy(init_policy),
         })
     }
 
@@ -141,12 +141,23 @@ impl XhciRootHub {
         }
     }
 
+    fn root_port_ignored_by_physics(&self, port_id: u8) -> bool {
+        self.physics.ignores_root_port(port_id)
+    }
+
     fn request_root_port_reset(&mut self, port_id: u8) -> Result<(), USBError> {
         let Some(idx) = port_id.checked_sub(1).map(usize::from) else {
             return Err(USBError::Other(anyhow::anyhow!(
                 "invalid root port reset request port=0"
             )));
         };
+        if self.root_port_ignored_by_physics(port_id) {
+            info!(
+                "xhci: root port {} reset request ignored by baremetal selective physics",
+                port_id
+            );
+            return Ok(());
+        }
         if idx >= self.reg.port_register_set.len() {
             return Err(USBError::Other(anyhow::anyhow!(
                 "root port reset request out of range port={} ports={}",
@@ -193,7 +204,7 @@ impl XhciRootHub {
         Ok(())
     }
 
-    fn init_selective_ports_3_4_skip_11(&mut self) -> Result<(), USBError> {
+    fn init_baremetal_selective_ports(&mut self) -> Result<(), USBError> {
         debug!("Observing selected xHCI Root Hub ports");
         self.log_status_mut("root-hub-init-begin");
         self.fail_if_halted("root-hub-init-begin")?;
@@ -207,7 +218,7 @@ impl XhciRootHub {
         Ok(())
     }
 
-    fn init_all_ports(&mut self) -> Result<(), USBError> {
+    fn init_emulated_full_reset_ports(&mut self) -> Result<(), USBError> {
         debug!("Resetting all ports of xHCI Root Hub");
         self.log_status_mut("root-hub-init-begin");
         self.fail_if_halted("root-hub-init-begin")?;
@@ -251,6 +262,7 @@ impl XhciRootHub {
             .ports()
             .iter()
             .filter(|port| matches!(port.state, PortState::Uninit))
+            .filter(|port| !self.root_port_ignored_by_physics(port.port_id))
             .map(|p| p.port_id)
             .collect::<Vec<_>>();
 
@@ -286,6 +298,7 @@ impl XhciRootHub {
             .ports()
             .iter()
             .filter(|port| matches!(port.state, PortState::Reseted))
+            .filter(|port| !self.root_port_ignored_by_physics(port.port_id))
             .map(|p| p.port_id)
             .collect::<Vec<_>>();
 

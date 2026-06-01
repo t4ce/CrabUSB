@@ -446,7 +446,11 @@ impl Device {
         {
             let dci = desc.dci();
             let mut ep_raw = self.new_ep(dci.into())?;
-            let periodic_burst_size = match self.port_speed {
+            let use_streams = XHCI_UAS_PRIMARY_STREAMS_ENABLED
+                && uas_alt
+                && matches!(desc.transfer_type, EndpointType::Bulk)
+                && desc.address != 0x04;
+            let endpoint_burst_size = match self.port_speed {
                 Speed::High
                     if matches!(
                         desc.transfer_type,
@@ -455,17 +459,14 @@ impl Device {
                 {
                     desc.packets_per_microframe.saturating_sub(1)
                 }
+                Speed::SuperSpeed | Speed::SuperSpeedPlus if use_streams => 15,
                 _ => 0,
             };
             ep_raw.configure_periodic(
                 desc.max_packet_size as usize,
-                periodic_burst_size,
+                endpoint_burst_size,
                 desc.interval,
             );
-            let use_streams = XHCI_UAS_PRIMARY_STREAMS_ENABLED
-                && uas_alt
-                && matches!(desc.transfer_type, EndpointType::Bulk)
-                && desc.address != 0x04;
             let ring_addr = if use_streams {
                 let stream_ctx_addr = ep_raw.configure_primary_streams(32)?;
                 for ring in ep_raw.stream_rings() {
@@ -514,6 +515,7 @@ impl Device {
                 if use_streams {
                     ep_mut.set_max_primary_streams(4);
                     ep_mut.set_linear_stream_array();
+                    ep_mut.set_max_burst_size(endpoint_burst_size.try_into().unwrap());
                 } else {
                     ep_mut.set_dequeue_cycle_state();
                 }
@@ -522,10 +524,10 @@ impl Device {
                     EndpointType::Isochronous | EndpointType::Interrupt => {
                         //init for isoch/interrupt
                         ep_mut.set_max_packet_size(desc.max_packet_size);
-                        ep_mut.set_max_burst_size(periodic_burst_size.try_into().unwrap());
+                        ep_mut.set_max_burst_size(endpoint_burst_size.try_into().unwrap());
                         ep_mut.set_mult(0); //always 0 for interrupt
                         let max_esit_payload =
-                            desc.max_packet_size as usize * (periodic_burst_size + 1);
+                            desc.max_packet_size as usize * (endpoint_burst_size + 1);
                         ep_mut
                             .set_average_trb_length(max_esit_payload.min(u16::MAX as usize) as u16);
                         ep_mut.set_max_endpoint_service_time_interval_payload_low(
