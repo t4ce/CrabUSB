@@ -31,7 +31,12 @@ impl TransferResultHandler {
     pub fn register_queue(&mut self, slot_id: u8, ep_id: u8, ring: &SendRing<TransferEvent>) {
         let id = TransQueueId { slot_id, ep_id };
         let handle = ring.finished_handle();
-        self.inner.lock().entry(id).or_default().push(handle);
+        let mut queues_by_id = self.inner.lock();
+        let queues = queues_by_id.entry(id).or_default();
+        // Endpoint reconfiguration currently leaves old completion queues registered.
+        // Prefer the newest ring so reused DMA addresses cannot deliver events to
+        // a stale queue and starve the live endpoint.
+        queues.insert(0, handle);
     }
 
     /// Marks a queue completion from the xHCI interrupt path.
